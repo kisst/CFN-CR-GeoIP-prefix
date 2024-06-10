@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda function to create a managed prefix list
+
+Resources:
+  CreatePrefixListFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreatePrefixList
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          LOG_LEVEL: 'INFO'
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import urllib3
+          from botocore.exceptions import ClientError, BotoCoreError
+          from urllib3.exceptions import HTTPError
+          import logging
+
+          try:
+              import cfnresponse
+              CFN_CALL = True
+          except ImportError:
+              CFN_CALL = False
+
+          IP_DENY_URL = "https://www.ipdeny.com/ipblocks/data/countries/"
+          http = urllib3.PoolManager()
+          log_level = os.getenv('LOG_LEVEL', 'INFO')
+          logging.basicConfig(level=logging.getLevelName(log_level))
+          
+          def fetch_ip_ranges(country_code):
+              url = f"{IP_DENY_URL}{country_code}.zone"
+              response = http.request('GET', url)
+              logging.debug(response.data)
+              if response.status != 200:
+                  raise HTTPError(f"Failed to fetch IP ranges: {response.status}")
+              return response.data.decode('utf-8').strip().split("\n")
+
+          def create_prefix_list(ec2, country_code, ip_ranges):
+              try:
+                  prefix_list = ec2.create_managed_prefix_list(
+                      PrefixListName=f"{country_code}-IP-Ranges",
+                      MaxEntries=len(ip_ranges),
+                      AddressFamily="IPv4",
+                      DryRun=False,
+                  )
+                  logging.debug(prefix_list)
+                  return prefix_list["PrefixList"]["PrefixListId"]
+              except ClientError as e:
+                  logging.error(f"Error creating prefix list: {e}")
+                  raise
+
+          def add_ip_ranges_to_prefix_list(ec2, prefix_list_id, ip_ranges, version):
+              entries = [{"Cidr": cidr} for cidr in ip_ranges]
+              try:
+                  ec2.modify_managed_prefix_list(
+                      PrefixListId=prefix_list_id,
+                      CurrentVersion=version,
+                      AddEntries=entries,
+                  )
+              except ClientError as e:
+                  logging.error(f"Error adding entries to prefix list: {e}")
+                  raise
+
+          def lambda_handler(event, context):
+              logging.debug(event)
+              try:
+                  if event["RequestType"] == "Delete":
+                      # using keep delete policy
+                      resp = cfnresponse.SUCCESS
+                      cfnresponse.send(event, context, resp, {})
+                      return
+                  region = event["ResourceProperties"]["region"]
+                  ec2 = boto3.client("ec2", region_name=region)
+                  country_code = event["ResourceProperties"]["country_code"].lower()
+                  ip_ranges = fetch_ip_ranges(country_code)
+                  prefix_list_id = create_prefix_list(ec2, country_code, ip_ranges)
+                  logging.info(f"Prefix list created: {prefix_list_id}")
+                  add_ip_ranges_to_prefix_list(ec2, prefix_list_id, ip_ranges, 1)
+                  logging.info(f"IP ranges added to prefix list {prefix_list_id}")
+                  if CFN_CALL:
+                      # prevent testing casue trouble
+                      data = {"Arn": prefix_list_id}
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, data, prefix_list_id)
+              except (ClientError, BotoCoreError, HTTPError) as e:
+                  logging.error(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:CreateManagedPrefixList'
+                  - 'ec2:ModifyManagedPrefixList'
+                Resource: '*'
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt CreatePrefixListFunction.Arn
+    Export:
+      Name: !Sub "cfn:geo-ip-cr:${AWS::Region}:arn"

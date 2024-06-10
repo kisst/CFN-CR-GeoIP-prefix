@@ -1,0 +1,21 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: testing geo ip creation
+
+Resources:
+  NorthKorea:
+    Properties:
+      ServiceToken:
+        Fn::ImportValue: !Sub "cfn:geo-ip-cr:${AWS::Region}:arn"
+      Name: northkorea
+      region: !Ref "AWS::Region"
+      country_code: kp
+    Type: Custom::PrefixList
+
+  Cuba:
+    Properties:
+      ServiceToken:
+        Fn::ImportValue: !Sub "cfn:geo-ip-cr:${AWS::Region}:arn"
+      Name: cuba
+      region: !Ref "AWS::Region"
+      country_code: cu
+    Type: Custom::PrefixList
